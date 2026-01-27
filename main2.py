@@ -103,7 +103,8 @@ llm = ChatGroq(
 # -------------------------------
 # Prompt Template (STRICT)
 # -------------------------------
-prompt = """
+prompt = ChatPromptTemplate.from_template(
+    """
 You are **TaxGPT**, an AI Tax Advisor specialized exclusively in **Pakistan Tax Laws**
 (Income Tax Ordinance, Sales Tax Act, Federal Excise Act, SROs, Rules, Notifications).
 
@@ -196,39 +197,16 @@ List ONLY PDFs that were actually used from the context:
 - No legal advice disclaimer text
 - No markdown outside the defined sections
 """
-
-
-contextualize_q_system_prompt = """
-Given a chat history and the latest user question,
-which might reference context in the chat history,
-formulate a standalone question that can be understood
-without the chat history. Do NOT answer the question.
-
-"""
-contextualize_q_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", contextualize_q_system_prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ]
 )
 
-history_aware_retriever = create_history_aware_retriever(
-    llm, retriever, contextualize_q_prompt
-)
 
-qa_prompt = ChatPromptTemplate.from_messages(
-    [
-        ("system", prompt),
-        MessagesPlaceholder("chat_history"),
-        ("human", "{input}"),
-    ]
-)
-question_answer_chain = create_stuff_documents_chain(llm, qa_prompt)
-
-rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chain)
 # -------------------------------
 # Create RAG Chain
+# -------------------------------
+document_chain = create_stuff_documents_chain(llm, prompt)
+# retrieval_chain = create_retrieval_chain(retriever, document_chain)
+
+
 
 
 # -------------------------------
@@ -236,24 +214,52 @@ rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chai
 # -------------------------------
 store = {}
 
-
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     if session_id not in store:
         store[session_id] = ChatMessageHistory()
     return store[session_id]
 
 
+
+
+# -------------------------------
+# History-aware retriever
+# -------------------------------
+contextualize_q_system_prompt = """
+Given a chat history and the latest user question,
+which might reference context in the chat history,
+formulate a standalone question that can be understood
+without the chat history. Do NOT answer the question.
+"""
+
+contextualize_q_prompt = ChatPromptTemplate.from_messages([
+    ("system", contextualize_q_system_prompt),
+    MessagesPlaceholder("chat_history"),
+    ("human", "{input}"),
+])
+
+history_aware_retriever = create_history_aware_retriever(
+    llm,
+    retriever,
+    contextualize_q_prompt
+)
+
+retrieval_chain = create_retrieval_chain(
+    history_aware_retriever,
+    document_chain
+)
+
 conversational_rag_chain = RunnableWithMessageHistory(
-    rag_chain,
+    retrieval_chain,
     get_session_history,
     input_messages_key="input",
     history_messages_key="chat_history",
     output_messages_key="answer",
 )
 
-# -------------------------------
-# History-aware retriever
-# -------------------------------
+
+
+
 
 
 def parse_llm_response(text: str):
@@ -274,26 +280,34 @@ def parse_llm_response(text: str):
 # -------------------------------
 # API Endpoint
 # -------------------------------
+@app.get('/test')
+async def home():
+    return 'Backend running!'
+
+
+
 @app.post("/ask")
-async def ask_taxgpt(request: AskRequest, req: Request, res: Response):
+async def ask_taxgpt(
+    request: AskRequest,
+    req: Request,
+    res: Response
+):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     try:
 
-        # 1️⃣ Get session ID from headers
-        session_id = req.headers.get("X-Session-ID")
-
-        print("Session ID:", session_id)
+         # 1️⃣ Get session ID ONLY from cookies
+        session_id = req.cookies.get("session_id")
 
         # 2️⃣ Create new session if missing
         if not session_id:
             session_id = str(uuid.uuid4())
 
-        # 3️⃣ Invoke history-aware chain
+         # 3️⃣ Invoke history-aware chain
         response = conversational_rag_chain.invoke(
             {"input": request.question},
-            config={"configurable": {"session_id": session_id}},
+            config={"configurable": {"session_id": session_id}}
         )
 
         parsed = parse_llm_response(response["answer"])
@@ -315,8 +329,17 @@ async def ask_taxgpt(request: AskRequest, req: Request, res: Response):
                     }
                 )
 
-        # 4️⃣ Always return session_id in response (no cookies)
-        # Frontend will handle session_id via localStorage and headers
+
+         # 4️⃣ Set cookie ONLY if new session
+        if not req.cookies.get("session_id"):
+            res.set_cookie(
+                key="session_id",
+                value=session_id,
+                max_age=30 * 24 * 60 * 60,
+                httponly=True,
+                secure= False,
+                samesite="lax",
+            )
 
         # return {
         #     "answer": response["answer"],
@@ -325,7 +348,6 @@ async def ask_taxgpt(request: AskRequest, req: Request, res: Response):
 
         # 4️⃣ Return clean JSON
         return {
-            "session_id": session_id,
             "Answer": parsed["main_answer"],
             "Applicable_Legal_References": parsed["legal_references"],
             "Summary": parsed["summary"],
@@ -340,12 +362,14 @@ async def ask_taxgpt(request: AskRequest, req: Request, res: Response):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+
 @app.post("/clear_history")
 async def clear_history(req: Request, res: Response):
-    session_id = req.headers.get("X-Session-ID")
+    session_id = req.cookies.get("session_id")
 
     if session_id and session_id in store:
         del store[session_id]
+        res.delete_cookie("session_id")
         return {"status": "history cleared"}
 
     return {"status": "no active session"}
