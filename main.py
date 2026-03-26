@@ -385,3 +385,4 @@ async def clear_history(req: Request, res: Response):
 
 
 # uvicorn main:app --reload
+# venv\Scripts\activate
