@@ -3,5 +3,15 @@
     "path": "test.pdf",
     "hash": "6d730748d6",
     "ingested_at": 1774537665
+  },
+  "name.pdf__78114156c5": {
+    "path": "Name.pdf",
+    "hash": "78114156c5",
+    "ingested_at": 1774540562
+  },
+  "testing.pdf__921ec4cc8d": {
+    "path": "testing.pdf",
+    "hash": "921ec4cc8d",
+    "ingested_at": 1774559289
   }
 }

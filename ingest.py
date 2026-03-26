@@ -197,7 +197,7 @@ def ingest_file(path: Path, force_reingest: bool = False):
 # IMPORTANT: Re-ingest with force_reingest=True because chunk_data was fixed
 print("Re-ingesting file with fixed chunk_data function...\n")
 ingest_file(
-    Path("test.pdf"),
+    Path("testing.pdf"),
     force_reingest=True  # Force re-ingest to use fixed chunking
 )
 

@@ -17,6 +17,11 @@ from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain.chains import create_retrieval_chain
 from langchain_core.prompts import ChatPromptTemplate
 
+from typing import List
+from pydantic import Field
+from langchain_core.retrievers import BaseRetriever
+from langchain_core.documents import Document
+
 
 # for chat history
 from langchain_community.chat_message_histories import ChatMessageHistory
@@ -84,7 +89,107 @@ index = pc.Index(os.getenv("PINECONE_INDEX"))
 
 vectorstore = PineconeVectorStore(index=index, embedding=embedding, text_key="text")
 
-retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+class MultiNamespaceRetriever(BaseRetriever):
+    """Retriever that queries all namespaces"""
+    
+    namespace_vectorstores: dict = Field(default_factory=dict)
+    index: any = Field(default=None)
+    embedding: any = Field(default=None)
+    k: int = Field(default=3)
+    
+    def _get_relevant_documents(self, query: str) -> List[Document]:
+        all_matches = []
+        seen_ids = set()
+
+        query_embedding = self.embedding.embed_query(query)
+
+        for ns in self.namespace_vectorstores.keys():
+
+            try:
+                results = self.index.query(
+                    vector=query_embedding,
+                    top_k=self.k * 3,
+                    namespace=ns if ns else None,
+                    include_metadata=True
+                )
+
+                for match in results.matches:
+                    metadata = match.metadata or {}
+                    text = (
+                        metadata.get("text")
+                        or metadata.get("page_content")
+                        or str(metadata)
+                    )
+
+                    all_matches.append({
+                        "score": match.score,
+                        "text": text,
+                        "metadata": {**metadata, "namespace": ns}
+                    })
+
+            except Exception as e:
+                print(f"Namespace error {ns}: {e}")
+
+        # 🔥 GLOBAL SORT BY SCORE
+        all_matches = sorted(
+            all_matches,
+            key=lambda x: x["score"],
+            reverse=True
+        )
+
+        # take final top-k
+        top_matches = all_matches[:self.k]
+
+        docs = []
+        for item in top_matches:
+            doc_id = hash(item["text"])
+            if doc_id not in seen_ids:
+                seen_ids.add(doc_id)
+                docs.append(
+                    Document(
+                        page_content=item["text"],
+                        metadata=item["metadata"]
+                    )
+                )
+
+        print("Query:", query)
+        print("Namespaces:", list(self.namespace_vectorstores.keys()))
+
+        return docs
+
+    async def _aget_relevant_documents(self, query: str) -> List[Document]:
+        return self._get_relevant_documents(query)
+
+# retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
+# Load all namespaces dynamically
+def create_multi_namespace_retriever():
+    stats = index.describe_index_stats()
+    namespaces = list(stats.get("namespaces", {}).keys())
+
+    if not namespaces:
+        namespaces = [None]
+
+    namespace_vectorstores = {
+        ns: PineconeVectorStore(
+            index=index,
+            embedding=embedding,
+            namespace=ns,
+            text_key="text"
+        )
+        for ns in namespaces
+    }
+
+    return MultiNamespaceRetriever(
+        namespace_vectorstores=namespace_vectorstores,
+        index=index,
+        embedding=embedding,
+        k=5
+    )
+
+retriever = create_multi_namespace_retriever()
+
 
 # -------------------------------
 # Initialize LLM
@@ -321,10 +426,40 @@ async def ask_taxgpt(
             session_id = str(uuid.uuid4())
 
          # 3️⃣ Invoke history-aware chain
+        # response = conversational_rag_chain.invoke(
+        #     {"input": request.question},
+        #     config={"configurable": {"session_id": session_id}}
+        # )
+
+
+        # 🔄 Refresh retriever to include new namespaces
+        global retriever, history_aware_retriever, rag_chain, conversational_rag_chain
+
+        retriever = create_multi_namespace_retriever()
+
+        history_aware_retriever = create_history_aware_retriever(
+            llm, retriever, contextualize_q_prompt
+        )
+
+        rag_chain = create_retrieval_chain(
+            history_aware_retriever,
+            question_answer_chain
+        )
+
+        conversational_rag_chain = RunnableWithMessageHistory(
+            rag_chain,
+            get_session_history,
+            input_messages_key="input",
+            history_messages_key="chat_history",
+            output_messages_key="answer",
+        )
+
+        # 3️⃣ Invoke history-aware chain
         response = conversational_rag_chain.invoke(
             {"input": request.question},
             config={"configurable": {"session_id": session_id}}
         )
+
 
         parsed = parse_llm_response(response["answer"])
 
@@ -380,7 +515,6 @@ async def clear_history(req: Request, res: Response):
         del store[session_id]
         return {"status": "history cleared"}
 
-    return {"status": "no active session"}
     return {"status": "no active session"}
 
 

@@ -11,3 +11,7 @@ venv/
 .env.development.local
 .env.test.local
 .env.production.local
+
+Name.pdf
+testing.pdf
+.doc_map.json
