@@ -1,3 +1,8 @@
+from ingest_service import ingest_from_url, delete_from_pinecone
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -6,6 +11,11 @@ import os
 import re
 import uuid
 from fastapi import Request, Response
+from fastapi import UploadFile, File
+import requests
+from fastapi import Query
+from vercel_blob import delete
+
 
 # LangChain & Vector DB
 from pinecone import Pinecone
@@ -30,6 +40,8 @@ from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain.chains import create_history_aware_retriever
 from langchain_core.prompts import MessagesPlaceholder
 
+
+executor = ThreadPoolExecutor(max_workers=2)
 
 # Load environment variables
 load_dotenv()
@@ -73,6 +85,10 @@ class AskResponse(BaseModel):
     sources: list[SourceDocument]
 
 
+class DeleteFileRequest(BaseModel):
+    url: str
+
+
 # -------------------------------
 # Initialize Embeddings
 # -------------------------------
@@ -92,12 +108,12 @@ vectorstore = PineconeVectorStore(index=index, embedding=embedding, text_key="te
 
 class MultiNamespaceRetriever(BaseRetriever):
     """Retriever that queries all namespaces"""
-    
+
     namespace_vectorstores: dict = Field(default_factory=dict)
     index: any = Field(default=None)
     embedding: any = Field(default=None)
     k: int = Field(default=3)
-    
+
     def _get_relevant_documents(self, query: str) -> List[Document]:
         all_matches = []
         seen_ids = set()
@@ -111,7 +127,7 @@ class MultiNamespaceRetriever(BaseRetriever):
                     vector=query_embedding,
                     top_k=self.k * 3,
                     namespace=ns if ns else None,
-                    include_metadata=True
+                    include_metadata=True,
                 )
 
                 for match in results.matches:
@@ -122,24 +138,22 @@ class MultiNamespaceRetriever(BaseRetriever):
                         or str(metadata)
                     )
 
-                    all_matches.append({
-                        "score": match.score,
-                        "text": text,
-                        "metadata": {**metadata, "namespace": ns}
-                    })
+                    all_matches.append(
+                        {
+                            "score": match.score,
+                            "text": text,
+                            "metadata": {**metadata, "namespace": ns},
+                        }
+                    )
 
             except Exception as e:
                 print(f"Namespace error {ns}: {e}")
 
         # 🔥 GLOBAL SORT BY SCORE
-        all_matches = sorted(
-            all_matches,
-            key=lambda x: x["score"],
-            reverse=True
-        )
+        all_matches = sorted(all_matches, key=lambda x: x["score"], reverse=True)
 
         # take final top-k
-        top_matches = all_matches[:self.k]
+        top_matches = all_matches[: self.k]
 
         docs = []
         for item in top_matches:
@@ -147,10 +161,7 @@ class MultiNamespaceRetriever(BaseRetriever):
             if doc_id not in seen_ids:
                 seen_ids.add(doc_id)
                 docs.append(
-                    Document(
-                        page_content=item["text"],
-                        metadata=item["metadata"]
-                    )
+                    Document(page_content=item["text"], metadata=item["metadata"])
                 )
 
         print("Query:", query)
@@ -161,7 +172,9 @@ class MultiNamespaceRetriever(BaseRetriever):
     async def _aget_relevant_documents(self, query: str) -> List[Document]:
         return self._get_relevant_documents(query)
 
+
 # retriever = vectorstore.as_retriever(search_kwargs={"k": 5})
+
 
 # Load all namespaces dynamically
 def create_multi_namespace_retriever():
@@ -173,10 +186,7 @@ def create_multi_namespace_retriever():
 
     namespace_vectorstores = {
         ns: PineconeVectorStore(
-            index=index,
-            embedding=embedding,
-            namespace=ns,
-            text_key="text"
+            index=index, embedding=embedding, namespace=ns, text_key="text"
         )
         for ns in namespaces
     }
@@ -185,8 +195,9 @@ def create_multi_namespace_retriever():
         namespace_vectorstores=namespace_vectorstores,
         index=index,
         embedding=embedding,
-        k=5
+        k=5,
     )
+
 
 retriever = create_multi_namespace_retriever()
 
@@ -337,11 +348,13 @@ formulate a standalone question that can be understood
 without the chat history. Do NOT answer the question.
 
 """
-contextualize_q_prompt = ChatPromptTemplate.from_messages([
-    ("system", contextualize_q_system_prompt),
-    MessagesPlaceholder("chat_history"),
-    ("human", "{input}"),
-])
+contextualize_q_prompt = ChatPromptTemplate.from_messages(
+    [
+        ("system", contextualize_q_system_prompt),
+        MessagesPlaceholder("chat_history"),
+        ("human", "{input}"),
+    ]
+)
 
 history_aware_retriever = create_history_aware_retriever(
     llm, retriever, contextualize_q_prompt
@@ -361,18 +374,17 @@ rag_chain = create_retrieval_chain(history_aware_retriever, question_answer_chai
 # Create RAG Chain
 
 
-
-
-
 # -------------------------------
 # Session Store (IN-MEMORY)
 # -------------------------------
 store = {}
 
+
 def get_session_history(session_id: str) -> BaseChatMessageHistory:
     if session_id not in store:
         store[session_id] = ChatMessageHistory()
     return store[session_id]
+
 
 conversational_rag_chain = RunnableWithMessageHistory(
     rag_chain,
@@ -406,18 +418,14 @@ def parse_llm_response(text: str):
 # API Endpoint
 # -------------------------------
 @app.post("/ask")
-async def ask_taxgpt(
-    request: AskRequest,
-    req: Request,
-    res: Response
-):
+async def ask_taxgpt(request: AskRequest, req: Request, res: Response):
     if not request.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
 
     try:
 
-         # 1️⃣ Get session ID from headers
-        session_id = req.headers.get('X-Session-ID')
+        # 1️⃣ Get session ID from headers
+        session_id = req.headers.get("X-Session-ID")
 
         print("Session ID:", session_id)
 
@@ -425,12 +433,11 @@ async def ask_taxgpt(
         if not session_id:
             session_id = str(uuid.uuid4())
 
-         # 3️⃣ Invoke history-aware chain
+        # 3️⃣ Invoke history-aware chain
         # response = conversational_rag_chain.invoke(
         #     {"input": request.question},
         #     config={"configurable": {"session_id": session_id}}
         # )
-
 
         # 🔄 Refresh retriever to include new namespaces
         global retriever, history_aware_retriever, rag_chain, conversational_rag_chain
@@ -442,8 +449,7 @@ async def ask_taxgpt(
         )
 
         rag_chain = create_retrieval_chain(
-            history_aware_retriever,
-            question_answer_chain
+            history_aware_retriever, question_answer_chain
         )
 
         conversational_rag_chain = RunnableWithMessageHistory(
@@ -457,9 +463,8 @@ async def ask_taxgpt(
         # 3️⃣ Invoke history-aware chain
         response = conversational_rag_chain.invoke(
             {"input": request.question},
-            config={"configurable": {"session_id": session_id}}
+            config={"configurable": {"session_id": session_id}},
         )
-
 
         parsed = parse_llm_response(response["answer"])
 
@@ -480,8 +485,7 @@ async def ask_taxgpt(
                     }
                 )
 
-
-         # 4️⃣ Always return session_id in response (no cookies)
+        # 4️⃣ Always return session_id in response (no cookies)
         # Frontend will handle session_id via localStorage and headers
 
         # return {
@@ -491,7 +495,7 @@ async def ask_taxgpt(
 
         # 4️⃣ Return clean JSON
         return {
-            "session_id": session_id, 
+            "session_id": session_id,
             "Answer": parsed["main_answer"],
             "Applicable_Legal_References": parsed["legal_references"],
             "Summary": parsed["summary"],
@@ -506,10 +510,71 @@ async def ask_taxgpt(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/upload-pdf")
+async def upload_pdf(file: UploadFile = File(...)):
+    try:
+
+        if file.content_type != "application/pdf":
+            raise HTTPException(status_code=400, detail="Only PDFs allowed")
+
+        contents = await file.read()
+
+        # Vercel Blob API
+        response = requests.put(
+            f"https://blob.vercel-storage.com/{file.filename}",
+            headers={
+                "Authorization": f"Bearer {os.getenv('BLOB_READ_WRITE_TOKEN')}",
+                "x-content-type": "application/pdf",
+                "x-content-disposition": "inline",
+            },
+            data=contents,
+        )
+
+        if response.status_code not in [200, 201]:
+            raise HTTPException(500, response.text)
+
+        blob_data = response.json()
+        blob_url = blob_data["url"]
+
+        # 2. Ingest into Pinecone in background (non-blocking)
+        # loop = asyncio.get_event_loop()
+        # loop.run_in_executor(executor, ingest_from_url, blob_url, False)
+
+        
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(executor, ingest_from_url, blob_url, False)
+
+        def handle_ingest_result(f):
+                try:
+                    print("Ingest result:", f.result())
+                except Exception as e:
+                    print("Background ingest failed:", e)
+
+        future.add_done_callback(handle_ingest_result)
+
+        return {"filename": file.filename, "url": blob_url}
+
+
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@app.delete("/delete-pdf")
+async def delete_pdf(url: str = Query(...)):
+    try:
+        delete(url)                  # Remove from Vercel Blob
+        delete_from_pinecone(url)    # Remove from Pinecone + doc_map.json
+        return {"message": "Deleted from storage and Pinecone successfully"}
+    except Exception as e:
+        print("DELETE ERROR:", e)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
 
 @app.post("/clear_history")
 async def clear_history(req: Request, res: Response):
-    session_id = req.headers.get('X-Session-ID')
+    session_id = req.headers.get("X-Session-ID")
 
     if session_id and session_id in store:
         del store[session_id]
