@@ -3,6 +3,7 @@ fastapi
 pymupdf
 uvicorn
 python-dotenv
+faiss-cpu
 langchain==0.3.27 
 langchain-community==0.3.29 
 langchain-core==0.3.79 

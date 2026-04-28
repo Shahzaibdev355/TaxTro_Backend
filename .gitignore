@@ -15,3 +15,7 @@ venv/
 Name.pdf
 testing.pdf
 .doc_map.json
+
+/uploads
+/uploads_staging
+/ingest_pdf_testing
