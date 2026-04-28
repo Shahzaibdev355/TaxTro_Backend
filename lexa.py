@@ -390,4 +390,5 @@ def chat_with_audit(session_id: str, body: ChatRequest):
     return {"question": body.question, "answer": result["answer"]}
 
 
-# uvicorn main3:app --reload
+# uvicorn lexa:app --reload
+# uvicorn lexa:app --reload --port 5000
